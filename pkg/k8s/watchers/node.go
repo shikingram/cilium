@@ -28,6 +28,7 @@ import (
 	"github.com/cilium/cilium/pkg/k8s/watchers/subscriber"
 	"github.com/cilium/cilium/pkg/lock"
 	nodeTypes "github.com/cilium/cilium/pkg/node/types"
+	"github.com/cilium/cilium/pkg/nodediscovery"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/source"
 )
@@ -43,13 +44,6 @@ var (
 // have their event handling methods called in order of registration.
 func (k *K8sWatcher) RegisterNodeSubscriber(s subscriber.Node) {
 	k.NodeChain.Register(s)
-}
-
-// The KVStoreNodeUpdater interface is used to provide an abstraction for the
-// nodediscovery.NodeDiscovery object logic used to update a node entry in the
-// KV store.
-type KVStoreNodeUpdater interface {
-	UpdateKVNodeEntry(node *nodeTypes.Node) error
 }
 
 func nodeEventsAreEqual(oldNode, newNode *v1.Node) bool {
@@ -153,25 +147,25 @@ func (k *K8sWatcher) GetK8sNode(_ context.Context, nodeName string) (*v1.Node, e
 // ciliumNodeUpdater implements the subscriber.Node interface and is used
 // to keep CiliumNode objects in sync with the node ones.
 type ciliumNodeUpdater struct {
-	k8sWatcher         *K8sWatcher
-	kvStoreNodeUpdater KVStoreNodeUpdater
+	k8sWatcher    *K8sWatcher
+	nodeDiscovery *nodediscovery.NodeDiscovery
 }
 
-func NewCiliumNodeUpdater(k8sWatcher *K8sWatcher, kvStoreNodeUpdater KVStoreNodeUpdater) *ciliumNodeUpdater {
+func NewCiliumNodeUpdater(k8sWatcher *K8sWatcher, nodeDiscovery *nodediscovery.NodeDiscovery) *ciliumNodeUpdater {
 	return &ciliumNodeUpdater{
-		k8sWatcher:         k8sWatcher,
-		kvStoreNodeUpdater: kvStoreNodeUpdater,
+		k8sWatcher:    k8sWatcher,
+		nodeDiscovery: nodeDiscovery,
 	}
 }
 
 func (u *ciliumNodeUpdater) OnAddNode(newNode *v1.Node, swg *lock.StoppableWaitGroup) error {
-	u.updateCiliumNode(u.kvStoreNodeUpdater, newNode)
+	u.updateCiliumNode(u.nodeDiscovery, newNode)
 
 	return nil
 }
 
 func (u *ciliumNodeUpdater) OnUpdateNode(oldNode, newNode *v1.Node, swg *lock.StoppableWaitGroup) error {
-	u.updateCiliumNode(u.kvStoreNodeUpdater, newNode)
+	u.updateCiliumNode(u.nodeDiscovery, newNode)
 
 	return nil
 }
@@ -180,7 +174,7 @@ func (u *ciliumNodeUpdater) OnDeleteNode(*v1.Node, *lock.StoppableWaitGroup) err
 	return nil
 }
 
-func (u *ciliumNodeUpdater) updateCiliumNode(kvStoreNodeUpdater KVStoreNodeUpdater, node *v1.Node) {
+func (u *ciliumNodeUpdater) updateCiliumNode(nodeDiscovery *nodediscovery.NodeDiscovery, node *v1.Node) {
 	var (
 		controllerName = fmt.Sprintf("sync-node-with-ciliumnode (%v)", node.Name)
 
@@ -192,8 +186,14 @@ func (u *ciliumNodeUpdater) updateCiliumNode(kvStoreNodeUpdater KVStoreNodeUpdat
 
 	doFunc := func(ctx context.Context) (err error) {
 		if option.Config.KVStore != "" && !option.Config.JoinCluster {
-			return kvStoreNodeUpdater.UpdateKVNodeEntry(k8sNodeParsed)
+			return nodeDiscovery.UpdateKVNodeEntry(k8sNodeParsed)
 		} else {
+			select {
+			case <-nodeDiscovery.LocalStateInitialized:
+			default:
+				return nil
+			}
+
 			u.k8sWatcher.ciliumNodeStoreMU.RLock()
 			defer u.k8sWatcher.ciliumNodeStoreMU.RUnlock()
 
